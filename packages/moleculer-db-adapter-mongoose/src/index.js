@@ -11,6 +11,15 @@ const Promise	= require("bluebird");
 const { ServiceSchemaError } = require("moleculer").Errors;
 const mongoose  = require("mongoose");
 
+////mongoose-diff-history code
+const omit = require('omit-deep');
+const pick = require('lodash.pick');
+const empty = require('deep-empty-object');
+const { assign } = require('power-assign');
+// try to find an id property, otherwise just use the index in the array
+const objectHash = (obj, idx) => obj._id || obj.id || `$$index: ${idx}`;
+const diffPatcher = require('jsondiffpatch').create({ objectHash });
+
 mongoose.set("useNewUrlParser", true);
 mongoose.set("useFindAndModify", false);
 mongoose.set("useCreateIndex", true);
@@ -25,6 +34,23 @@ class MongooseDbAdapter {
 	 * @memberof MongooseDbAdapter
 	 */
 	constructor(uri, opts) {
+		if(opts.HistorySchema){
+			this.historySchema = new mongoose.Schema(
+										{
+											collectionName: String,
+											collectionId: Schema.Types.ObjectId,
+											diff: {},
+											user: {},
+											reason: String,
+											version: { type: Number, min: 0 }
+										},
+										{
+											timestamps: true
+										}
+									);
+			this.historyModel = mongoose.model(opts.HistorySchema, this.historySchema);
+			delete opts.HistorySchema;
+		}
 		this.uri = uri,
 		this.opts = opts;
 		mongoose.Promise = Promise;
@@ -56,6 +82,58 @@ class MongooseDbAdapter {
 			/* istanbul ignore next */
 			throw new ServiceSchemaError("Missing `model` or `schema` definition in schema of service!");
 		}
+		
+		//Added from mongoose-diff-history
+		this.schema.pre('save', function (next) {
+			if (this.isNew) return next();
+			this.constructor
+				.findOne({ _id: this._id })
+				.then(original => {
+					if (checkRequired(opts, {}, this)) {
+						return;
+					}
+					return saveDiffObject(this, original, this.toObject({ depopulate: true }), opts);
+				})
+				.then(() => next())
+				.catch(next);
+		});
+
+		this.schema.pre('findOneAndUpdate', function (next) {
+			if (checkRequired(opts, this)) {
+				return next();
+			}
+			saveDiffs(this, opts)
+				.then(() => next())
+				.catch(next);
+		});
+
+		this.schema.pre('update', function (next) {
+			if (checkRequired(opts, this)) {
+				return next();
+			}
+			saveDiffs(this, opts)
+				.then(() => next())
+				.catch(next);
+		});
+
+		this.schema.pre('updateOne', function (next) {
+			if (checkRequired(opts, this)) {
+				return next();
+			}
+			saveDiffs(this, opts)
+				.then(() => next())
+				.catch(next);
+		});
+
+		this.schema.pre('remove', function (next) {
+			if (checkRequired(opts, this)) {
+				return next();
+			}
+			saveDiffObject(this, this, {}, opts)
+				.then(() => next())
+				.catch(next);
+		});
+		
 	}
 
 	/**
@@ -418,6 +496,244 @@ class MongooseDbAdapter {
 			return id.toString();
 		return id;
 	}
+
+	/**
+	* check if required parameters available for diff history
+	* @param {Object} opts
+	* @param {Object} queryObject
+	* @param {Object} updatedObject
+	* @returns {Boolean}
+	* @memberof MongooseDbAdapter
+	*/
+	//https://eslint.org/docs/rules/complexity#when-not-to-use-it
+	/* eslint-disable complexity */
+	checkRequired(opts, queryObject, updatedObject) {
+		if(!this.historyModel) 
+			return; //Do Not check if history model is not defined
+		if (queryObject && !queryObject.options && !updatedObject) {
+			return;
+		}
+		const { __user: user, __reason: reason } =
+			(queryObject && queryObject.options) || updatedObject;
+		if (
+			opts.required &&
+			((opts.required.includes('user') && !user) ||
+				(opts.required.includes('reason') && !reason))
+		) {
+			return true;
+		}
+	}
+	
+	saveDiffObject(currentObject, original, updated, opts, queryObject) {
+		if(!this.historyModel) 
+			return; //Do Not save the diff if history model is not defined
+		const { __user: user, __reason: reason, __session: session } =
+			(queryObject && queryObject.options) || currentObject;
+
+		let diff = diffPatcher.diff(
+			JSON.parse(JSON.stringify(original)),
+			JSON.parse(JSON.stringify(updated))
+		);
+
+		if (opts.omit) {
+			omit(diff, opts.omit, { cleanEmpty: true });
+		}
+
+		if (opts.pick) {
+			diff = pick(diff, opts.pick);
+		}
+
+		if (!diff || !Object.keys(diff).length || empty.all(diff)) {
+			return;
+		}
+
+		const collectionId = currentObject._id;
+		const collectionName = this.model.collection.collectionName;
+
+		return History.findOne({ collectionId, collectionName })
+			.sort('-version')
+			.then(lastHistory => {
+				const history = new this.historyModel({
+					collectionId,
+					collectionName,
+					diff,
+					user,
+					reason,
+					version: lastHistory ? lastHistory.version + 1 : 0
+				});
+				if (session) {
+					return history.save({ session });
+				}
+				return history.save();
+			});
+	}
+	
+	/* eslint-disable complexity */
+	const saveDiffHistory = (queryObject, currentObject, opts) => {
+		if(!this.historyModel) 
+			return; //Do Not save the diff if history model is not defined
+		
+		const queryUpdate = queryObject.getUpdate();
+		const schemaOptions = queryObject.model.schema.options || {};
+
+		let keysToBeModified = [];
+		let mongoUpdateOperations = [];
+		let plainKeys = [];
+
+		for (const key in queryUpdate) {
+			const value = queryUpdate[key];
+			if (key.startsWith('$') && typeof value === 'object') {
+				const innerKeys = Object.keys(value);
+				keysToBeModified = keysToBeModified.concat(innerKeys);
+				if (key !== '$setOnInsert') {
+					mongoUpdateOperations = mongoUpdateOperations.concat(key);
+				}
+			} else {
+				keysToBeModified = keysToBeModified.concat(key);
+				plainKeys = plainKeys.concat(key);
+			}
+		}
+
+		const dbObject = pick(currentObject, keysToBeModified);
+		let updatedObject = assign(
+			dbObject,
+			pick(queryUpdate, mongoUpdateOperations),
+			pick(queryUpdate, plainKeys)
+		);
+
+		let { strict } = queryObject.options || {};
+		// strict in Query options can override schema option
+		strict = strict !== undefined ? strict : schemaOptions.strict;
+
+		if (strict === true) {
+			const validPaths = Object.keys(queryObject.model.schema.paths);
+			updatedObject = pick(updatedObject, validPaths);
+		}
+
+		return saveDiffObject(
+			currentObject,
+			dbObject,
+			updatedObject,
+			opts,
+			queryObject
+		);
+	};
+	
+	const saveDiffs = (queryObject, opts) =>
+		queryObject
+			.find(queryObject._conditions)
+			.cursor()
+			.eachAsync(result => saveDiffHistory(queryObject, result, opts));
+	
+	const getVersion = (id, version, queryOpts, cb) => {
+		if(!this.historyModel) 
+			return; //Do Not save the diff if history model is not defined
+		
+		if (typeof queryOpts === 'function') {
+			cb = queryOpts;
+			queryOpts = undefined;
+		}
+
+		return this.model
+			.findById(id, null, queryOpts)
+			.then(latest => {
+				latest = latest || {};
+				return this.historyModel.find(
+					{
+						collectionName: this.model.collection.collectionName,
+						collectionId: id,
+						version: { $gte: parseInt(version, 10) }
+					},
+					{ diff: 1, version: 1 },
+					{ sort: '-version' }
+				)
+					.lean().cursor()
+					.eachAsync(history => {
+						diffPatcher.unpatch(latest, history.diff);
+					})
+					.then(() => {
+						if (isValidCb(cb)) return cb(null, latest);
+						return latest;
+					});
+			})
+			.catch(err => {
+				if (isValidCb(cb)) return cb(err, null);
+				throw err;
+			});
+	};
+	
+	const getDiffs = (id, opts, cb) => {
+		if(!this.historyModel) 
+			return; //Do Not save the diff if history model is not defined
+		
+		opts = opts || {};
+		if (typeof opts === 'function') {
+			cb = opts;
+			opts = {};
+		}
+		return this.historyModel.find(
+			{ collectionName: this.model.collection.collectionName, collectionId: id },
+			null, opts)
+			.lean()
+			.then(histories => {
+				if (isValidCb(cb)) return cb(null, histories);
+				return histories;
+			})
+			.catch(err => {
+				if (isValidCb(cb)) return cb(err, null);
+				throw err;
+			});
+	};
+	
+	const getHistories = (id, expandableFields, cb) => {
+		if(!this.historyModel) 
+			return; //Do Not save the diff if history model is not defined
+		
+		expandableFields = expandableFields || [];
+		if (typeof expandableFields === 'function') {
+			cb = expandableFields;
+			expandableFields = [];
+		}
+
+		const histories = [];
+
+		return this.historyModel.find({ collectionName: this.model.collection.collectionName, collectionId: id })
+			.lean().cursor()
+			.eachAsync(history => {
+				const changedValues = [];
+				const changedFields = [];
+				for (const key in history.diff) {
+					if (history.diff.hasOwnProperty(key)) {
+						if (expandableFields.indexOf(key) > -1) {
+							const oldValue = history.diff[key][0];
+							const newValue = history.diff[key][1];
+							changedValues.push(
+								key + ' from ' + oldValue + ' to ' + newValue
+							);
+						} else {
+							changedFields.push(key);
+						}
+					}
+				}
+				const comment =
+					'modified ' + changedFields.concat(changedValues).join(', ');
+				histories.push({
+					changedBy: history.user,
+					changedAt: history.createdAt,
+					updatedAt: history.updatedAt,
+					reason: history.reason,
+					comment: comment
+				});
+			})
+			.then(() => {
+				if (isValidCb(cb)) return cb(null, histories);
+				return histories;
+			})
+			.catch(err => {
+				if (isValidCb(cb)) return cb(err, null);
+				throw err;
+			});
+	};
 }
 
 module.exports = MongooseDbAdapter;
